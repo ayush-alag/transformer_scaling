@@ -49,9 +49,8 @@ def benchmark_model(model, args):
 
         with nvtx.range("forward"):
             output = run_forward(model, args)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         forward_times.append((timer() - start_time) * 1000)
 
@@ -61,9 +60,8 @@ def benchmark_model(model, args):
 
             with nvtx.range("backward"):
                 run_backward(output)
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
             backward_times.append((timer() - start_time) * 1000)
 

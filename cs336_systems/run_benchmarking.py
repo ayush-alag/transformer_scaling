@@ -22,8 +22,8 @@ configs = [
 context_lengths = [128, 256, 512, 1024]
 
 # Run benchmarks and collect results
-results = []
 for context_length in context_lengths:
+    results = []
     print(f"\nBenchmarking {context_length} context length...")
     for config in configs:
         print(f"\nBenchmarking {config.size} model...")
@@ -31,8 +31,12 @@ for context_length in context_lengths:
         # Create command line arguments
         cmd_args = [
             "nsys", "profile",
-            "-o", f"result_ctx{context_length}_{config.size}",
-            "python", "benchmarking_script.py",
+            "-f", "true",
+            "-o", f"/data/c-aalag/nvtx_results/result_ctx{context_length}_{config.size}",
+            "--trace=cuda,nvtx",
+            "--",
+            "uv", "run",
+            "python", "cs336_systems/benchmarking_script.py",
             "--device", "cuda",
             "--d_model", str(config.d_model),
             "--d_ff", str(config.d_ff),
@@ -47,25 +51,30 @@ for context_length in context_lengths:
             "--run_backward"
         ]
 
-        # Run the benchmark script with nsys profile
-        process = subprocess.run(cmd_args, capture_output=True, text=True)
+        process = subprocess.run(
+            cmd_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True,
+        )
 
-        # Parse the output to get timing results
-        output_lines = process.stdout.split('\n')
+        lines = process.stdout.splitlines()
+        lines = [L for L in lines if not L.startswith(("==>", "Collecting", "Exporting", "Quitting"))]
+
         forward_time = None
         forward_stdev = None
         backward_time = None
         backward_stdev = None
-
-        for line in output_lines:
-            if "Forward pass:" in line:
-                parts = line.split()
-                forward_time = float(parts[2])
-                forward_stdev = float(parts[4])
-            elif "Backward pass:" in line:
-                parts = line.split()
-                backward_time = float(parts[2])
-                backward_stdev = float(parts[4])
+        for line in lines:
+            if line.startswith("Forward pass:"):
+                parts = line.split("±")
+                forward_time = float(parts[0].split(":")[1].strip())
+                forward_stdev = float(parts[1].split()[0].strip())
+            elif line.startswith("Backward pass:"):
+                parts = line.split("±")
+                backward_time = float(parts[0].split(":")[1].strip())
+                backward_stdev = float(parts[1].split()[0].strip())
 
         results.append({
             'Model': config.size,
@@ -80,3 +89,5 @@ for context_length in context_lengths:
     latex_table = df.to_latex(index=False, float_format=lambda x: '{:.2f}'.format(x))
     print("\nLaTeX Table:")
     print(latex_table)
+
+# srun --partition=a1-batch --qos=a1-batch-qos --gpus=1 --pty bash -c "uv run python cs336_systems/run_benchmarking.py"
