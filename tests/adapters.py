@@ -4,19 +4,20 @@ from typing import Type
 
 import torch
 
+from cs336_systems.flash_attention2 import FlashAttention2
 
 
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
-    Returns a torch.autograd.Function subclass that implements RMSNorm.
-    The expectation is that this class will implement RMSNorm
+    Returns a torch.autograd.Function subclass that implements FlashAttention2.
+    The expectation is that this class will implement FlashAttention2
     using standard PyTorch operations.
 
     Returns:
         A class object (not an instance of the class)
     """
     # For example: return MyRMSNormAutogradFunctionClass
-    raise NotImplementedError
+    return FlashAttention2
 
 
 def get_flashattention_autograd_function_triton() -> Type:
