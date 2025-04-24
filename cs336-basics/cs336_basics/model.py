@@ -13,6 +13,8 @@ import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
 
+import torch.cuda.nvtx as nvtx
+
 
 from .nn_utils import softmax
 
@@ -29,7 +31,7 @@ class Linear(nn.Module):
             d_out: int
                 The number of output features.
         """
-        
+
         super().__init__()
         std = math.sqrt(2 / (d_in + d_out))
         self.weight: Float[Tensor, " d_out d_in"] = nn.Parameter(
@@ -39,7 +41,7 @@ class Linear(nn.Module):
 
     def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
         return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
-    
+
     def extra_repr(self):
         return f"d_out={self.weight.shape[0]}, d_in={self.weight.shape[1]}"
 
@@ -52,10 +54,10 @@ class Embedding(nn.Module):
             nn.init.trunc_normal_(torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std),
             requires_grad=True
         )
-    
+
     def forward(self, token_ids: Int[Tensor, " ..."]) -> Float[Tensor, " ... d_model"]:
         return self.weight[token_ids, :]
-    
+
     def extra_repr(self):
         return f"vocab_size={self.weight.shape[0]}, d={self.weight.shape[1]}"
 
@@ -105,7 +107,7 @@ class RMSNorm(nn.Module):
         x = x * rms
 
         return (self.weight * x).to(in_dtype)
-    
+
     def extra_repr(self):
         return f"hidden_size={self.weight.shape[0]}, eps={self.eps}"
 
@@ -117,7 +119,7 @@ class RotaryEmbedding(nn.Module):
             "_freq_cis_cache",
             RotaryEmbedding._init_cache(context_length, dim, theta), persistent=False
         )
-    
+
     @staticmethod
     def _init_cache(context_length: int, dim: int, theta: float) -> Float[Tensor, " 2 context_length half_dim"]:
         assert dim % 2 == 0
@@ -145,7 +147,7 @@ class RotaryEmbedding(nn.Module):
         x2_rot = sin * x1 + cos * x2
         result = einx.rearrange('... x_half, ... x_half -> ... (x_half (1 + 1))', x1_rot, x2_rot).contiguous()
         return result
-    
+
     def extra_repr(self):
         return f"context_length={self._freq_cis_cache.shape[0]}, dim/2={self._freq_cis_cache.shape[1]}"
 
@@ -278,7 +280,7 @@ class BasicsTransformerLM(nn.Module):
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
-            
+
         original_sequence_length = x.size(-1)
         for _ in range(max_new_tokens):
             # Take the last `context_length` tokens if the input is
@@ -377,7 +379,9 @@ class TransformerBlock(nn.Module):
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
+        ln_x = self.ln1(x)
+        with nvtx.range("attn"):
+            x_attn = self.attn(ln_x)
         attn_sublayer_output = x + x_attn
 
         # Apply the feed-forward sublayer
@@ -427,11 +431,12 @@ def scaled_dot_product_attention(
     if mask is not None:
         attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    with nvtx.range("softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
     return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
-
+@nvtx.range("CausalMultiHeadSelfAttention")
 class CausalMultiHeadSelfAttention(nn.Module):
     """Multi-Head Self-Attention
 

@@ -1,10 +1,10 @@
 import argparse
 from enum import Enum
-from cs336_basics import BasicsTransformerLM
+from cs336_basics import BasicsTransformerLM, AdamW
 import torch
 from timeit import default_timer as timer
 import torch.cuda.nvtx as nvtx
-
+from contextlib import nullcontext
 def create_model(args):
    model = BasicsTransformerLM(
       vocab_size=args.vocab_size,
@@ -23,6 +23,8 @@ def create_model(args):
 def benchmark_model(model, args):
     torch.cuda.empty_cache()
     model.eval()
+
+    optimizer = AdamW(model.parameters(), lr=1e-3)
     def run_forward(model, args):
         input_ids = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=args.device)
         output = model(input_ids).mean()
@@ -32,38 +34,56 @@ def benchmark_model(model, args):
     def run_backward(output):
         output.backward()
 
-    # some warmup steps
-    for _ in range(args.warmup_steps):
-        output = run_forward(model, args)
+    if args.autocast:
+        context_manager = torch.autocast(device_type=args.device, dtype=torch.bfloat16)
+    else:
+        context_manager = nullcontext()
+
+    with context_manager:
+        # some warmup steps
+        for _ in range(args.warmup_steps):
+            output = run_forward(model, args)
         if args.run_backward:
             run_backward(output)
+            optimizer.step()
+            optimizer.zero_grad()
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-    # benchmark steps
-    forward_times = []
-    backward_times = []
-    for _ in range(args.n_steps):
-        start_time = timer()
+        # benchmark steps
+        forward_times = []
+        backward_times = []
+        if args.memory_profile:
+            torch.cuda.memory._record_memory_history(max_entries=1000000)
 
-        with nvtx.range("forward"):
-            output = run_forward(model, args)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-        forward_times.append((timer() - start_time) * 1000)
-
-        if args.run_backward:
-            model.zero_grad()
+        for _ in range(args.n_steps):
             start_time = timer()
 
-            with nvtx.range("backward"):
-                run_backward(output)
+            with nvtx.range("forward"):
+                output = run_forward(model, args)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
 
-            backward_times.append((timer() - start_time) * 1000)
+            forward_times.append((timer() - start_time) * 1000)
+
+            if args.run_backward:
+                model.zero_grad()
+                start_time = timer()
+
+                with nvtx.range("backward"):
+                    run_backward(output)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+
+                backward_times.append((timer() - start_time) * 1000)
+
+                with nvtx.range("step"):
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+        if args.memory_profile:
+            torch.cuda.memory._dump_snapshot(f"memory_snapshot_autocast_fo_{args.model_name}_{args.context_length}.pickle")
 
     print(f"Forward times: {forward_times}")
     print(f"Backward times: {backward_times}")
@@ -92,10 +112,13 @@ if __name__ == "__main__":
     parser.add_argument("--num_heads", type=int, default=16)
     parser.add_argument("--context_length", type=int, default=128)
     parser.add_argument("--rope_theta", type=float, default=1e6)
+    parser.add_argument("--model_name", type=str, default="small")
     # benchmarking args
     parser.add_argument("--warmup_steps", type=int, default=5)
     parser.add_argument("--n_steps", type=int, default=10)
     parser.add_argument("--run_backward", action="store_true")
+    parser.add_argument("--autocast", action="store_true")
+    parser.add_argument("--memory_profile", action="store_true")
     # device args
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()

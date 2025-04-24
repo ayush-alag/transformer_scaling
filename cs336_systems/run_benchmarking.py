@@ -19,22 +19,28 @@ configs = [
     Config("2.7B", 2560, 10240, 32, 32)
 ]
 
-context_lengths = [128, 256, 512, 1024]
+# context_lengths = [128, 256, 512, 1024]
+context_lengths = [128, 256, 512]
+big_config_only = [Config("2.7B", 2560, 10240, 32, 32)]
+# context_lengths = [512]
 
 # Run benchmarks and collect results
 for context_length in context_lengths:
     results = []
     print(f"\nBenchmarking {context_length} context length...")
-    for config in configs:
+    if context_length == 1024:
+        configs = configs[:-3] # skip 2.7B model for 1024 context length
+
+    for config in big_config_only:
         print(f"\nBenchmarking {config.size} model...")
 
         # Create command line arguments
         cmd_args = [
-            "nsys", "profile",
-            "-f", "true",
-            "-o", f"/data/c-aalag/nvtx_results/result_ctx{context_length}_{config.size}",
-            "--trace=cuda,nvtx",
-            "--",
+            # "nsys", "profile",
+            # "-f", "true",
+            # "-o", f"/data/c-aalag/memory_results/autocast_ctx{context_length}_{config.size}",
+            # "--trace=cuda,nvtx",
+            # "--",
             "uv", "run",
             "python", "cs336_systems/benchmarking_script.py",
             "--device", "cuda",
@@ -48,7 +54,10 @@ for context_length in context_lengths:
             "--rope_theta", "1e6",
             "--warmup_steps", "5",
             "--n_steps", "10",
-            "--run_backward"
+            "--model_name", config.size,
+            # "--run_backward",
+            "--autocast",
+            "--memory_profile"
         ]
 
         process = subprocess.run(
