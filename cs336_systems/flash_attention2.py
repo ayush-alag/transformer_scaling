@@ -18,7 +18,10 @@ def flash_fwd_kernel(
         D: tl.constexpr,
         Q_TILE_SIZE: tl.constexpr,
         K_TILE_SIZE: tl.constexpr,
+        is_causal: tl.constexpr,
 ):
+    ctx.is_causal = is_causal
+
     # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
@@ -28,84 +31,87 @@ def flash_fwd_kernel(
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
-        strides=(stride_qb, stride_qq, stride_qd),
+        strides=(stride_qq, stride_qd),
         offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        tile_shape=(Q_TILE_SIZE, D),
+        block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
-
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
-        strides=(stride_ob, stride_oq, stride_od),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        tile_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES,),
-        strides=(stride_lb, stride_lq),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        tile_shape=(Q_TILE_SIZE,),
-        order=(1, 0),
-    )
-
-    # now let's load Q, O, L
-    q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    o_tile = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    l_tile = tl.load(L_block_ptr, boundary_check=(0, 1), padding_option="zero")
-
-    o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-    m_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-    s_ij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
 
     kt_block_ptr = tl.make_block_ptr(
         K_ptr + batch_index * stride_kb,
         shape=(D, N_KEYS),
         strides=(stride_kd, stride_kk),
         offsets=(0, 0),
-        tile_shape=(D, K_TILE_SIZE),
+        block_shape=(D, K_TILE_SIZE),
         order=(0, 1),
     )
 
     v_block_ptr = tl.make_block_ptr(
         V_ptr + batch_index * stride_vb,
-        shape=(N_QUERIES, D),
-        strides=(stride_vb, stride_vk),
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
         offsets=(0, 0),
-        tile_shape=(Q_TILE_SIZE, D),
+        block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
+
+    # now let's load Q, O, L
+    q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    # store q as float16
+    q_tile = (q_tile * scale).to(tl.float16)
+
+    # our temporary variables stored in memory
+    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    m_i = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32)
+    o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
 
     # we want to loop over all the k tiles
     for _ in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         # load the K tile
-        kt_tile = tl.load(kt_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
-        v_tile = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+        kt_tile = tl.load(kt_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16) # (D, K_TILE_SIZE)
+        v_tile = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16) # (K_TILE_SIZE, D)
 
-        # do some stuff with k, q, v
-        tl.dot(q_tile, kt_tile, acc=s_ij) * scale
-        new_m_i = tl.max(m_i, s_ij.amax(dim=-1))
-        p_tilde = tl.exp(s_ij - new_m_i.unsqueeze(-1))
-        exp_mi_diff = tl.exp(m_i - new_m_i)
-        l_i = exp_mi_diff * l_tile + tl.sum(p_tilde, dim=-1)
-        o_i = tl.dot(p_tilde.to(v_tile.dtype), v_tile, o_i) + exp_mi_diff.unsqueeze(-1) * o_tile
+        # accumulate matrix multiplication
+        s_ij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
+        s_ij = tl.dot(q_tile, kt_tile, acc=s_ij)
+
+        # update m_i
+        new_m_i = tl.maximum(m_i, tl.max(s_ij, axis=-1))
+        p_tilde = tl.math.exp(s_ij - new_m_i[:, None])
+        exp_mi_diff = tl.math.exp(m_i - new_m_i)
+        l_i = l_i * exp_mi_diff + tl.sum(p_tilde, -1)
+        o_i = exp_mi_diff[:, None] * o_i
+        o_i = tl.dot(p_tilde.to(v_tile.dtype), v_tile, acc=o_i)
 
         m_i = new_m_i
-        l_tile = l_i
 
         kt_block_ptr = kt_block_ptr.advance((0, K_TILE_SIZE))
-        v_block_ptr = v_block_ptr.advance((0, K_TILE_SIZE))
+        v_block_ptr = v_block_ptr.advance((K_TILE_SIZE, 0))
 
-    o_i = l_i.reciprocal() * o_i
+    o_i /= l_i[:, None]
     l_i = tl.log(l_i) + m_i
 
     # todo: verify the boundary check
-    tl.store(O_block_ptr, o_i.to(o_tile.dtype), boundary_check=(0,))
-    tl.store(L_block_ptr, l_i.to(l_tile.dtype), boundary_check=(0,))
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    tl.store(O_block_ptr, o_i, boundary_check=(0,1))
+    tl.store(L_block_ptr, l_i, boundary_check=(0,))
 
 
 class TritonFlashAttention2(torch.autograd.Function):
@@ -125,8 +131,8 @@ class TritonFlashAttention2(torch.autograd.Function):
         o = torch.empty(b, n_q, d, device=q.device)
         l = torch.empty(b, n_q, device=q.device)
 
-        # Launch our kernel with n instances in our 1D grid.
-        flash_fwd_kernel[(tl.cdiv(n_q, ctx.Q_TILE_SIZE),)](
+        # Launch our kernel with an instance per batch element per tile
+        flash_fwd_kernel[(triton.cdiv(n_q, ctx.Q_TILE_SIZE), b)](
             q, k, v,
             o, l,
             q.stride(0), q.stride(1), q.stride(2),
@@ -138,6 +144,7 @@ class TritonFlashAttention2(torch.autograd.Function):
             D=d, scale=1 / sqrt(d),
             Q_TILE_SIZE=ctx.Q_TILE_SIZE,
             K_TILE_SIZE=ctx.K_TILE_SIZE,
+            is_causal=mask is not None,
         )
 
         ctx.save_for_backward(o, l, k, v)
@@ -150,7 +157,6 @@ class TritonFlashAttention2(torch.autograd.Function):
 
 
 class FlashAttention2(torch.autograd.Function):
-    # TODO: Handle the batch size dimension
     @staticmethod
     def forward(ctx, q, k, v, mask=None):
         b_q, b_k = 16, 16
