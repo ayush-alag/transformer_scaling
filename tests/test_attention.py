@@ -73,7 +73,7 @@ def test_flash_forward_pass_triton(is_causal):
 
 def flash_backward_results(impl, is_causal, device=None):
     q, k, v, do = _make_attn_inputs(device=device)
-    impl(q, k, v, is_causal).backward(do) 
+    impl(q, k, v, is_causal).backward(do)
     return q.grad, k.grad, v.grad
 
 
