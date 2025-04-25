@@ -20,8 +20,6 @@ def flash_fwd_kernel(
         K_TILE_SIZE: tl.constexpr,
         is_causal: tl.constexpr,
 ):
-    ctx.is_causal = is_causal
-
     # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
@@ -65,8 +63,9 @@ def flash_fwd_kernel(
     m_i = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32)
     o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
 
-    # we want to loop over all the k tiles
-    for _ in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    # we want to loop over all the k tiles up to the current query position if causal
+    max_tiles = (query_tile_index + 1) * Q_TILE_SIZE if is_causal else N_KEYS
+    for k_tile_index in range(tl.cdiv(max_tiles, K_TILE_SIZE)):
         # load the K tile
         kt_tile = tl.load(kt_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16) # (D, K_TILE_SIZE)
         v_tile = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16) # (K_TILE_SIZE, D)
@@ -74,6 +73,12 @@ def flash_fwd_kernel(
         # accumulate matrix multiplication
         s_ij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
         s_ij = tl.dot(q_tile, kt_tile, acc=s_ij)
+
+        if is_causal:
+            q_range = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            k_range = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            causal_mask = q_range[:, None] < k_range[None, :]
+            s_ij = tl.where(causal_mask, -1e6, s_ij)
 
         # update m_i
         new_m_i = tl.maximum(m_i, tl.max(s_ij, axis=-1))
@@ -123,6 +128,8 @@ class TritonFlashAttention2(torch.autograd.Function):
         assert q.is_cuda and k.is_cuda and v.is_cuda, "Expected CUDA tensors"
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous(), "Our pointer arithmetic will assume contiguous q,k,v"
 
+        ctx.is_causal = mask
+
         # b_q and b_k are chosen to be 16
         ctx.Q_TILE_SIZE = 16
         ctx.K_TILE_SIZE = 16
@@ -144,7 +151,7 @@ class TritonFlashAttention2(torch.autograd.Function):
             D=d, scale=1 / sqrt(d),
             Q_TILE_SIZE=ctx.Q_TILE_SIZE,
             K_TILE_SIZE=ctx.K_TILE_SIZE,
-            is_causal=mask is not None,
+            is_causal=ctx.is_causal,
         )
 
         ctx.save_for_backward(o, l, k, v)
