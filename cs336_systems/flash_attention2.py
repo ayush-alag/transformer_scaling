@@ -217,9 +217,22 @@ class FlashAttention2(torch.autograd.Function):
             O[:, start_i:end_i, :] = einsum(l_i.reciprocal(), o_i, '... k, ... k d -> ... k d')
             L[:, start_i:end_i] = torch.log(l_i) + m_i
 
-        ctx.save_for_backward(O, L, k, v)
+        ctx.save_for_backward(O, L, q, k, v)
         return O
 
     @staticmethod
-    def backward(ctx, dO, dL, dk, dv):
-        return NotImplementedError
+    def backward(ctx, dO):
+        O, L, Q, K, V = ctx.saved_tensors
+        d = K.shape[-1]
+        # return dQ, dK, dV
+        S = einsum(Q, K, '... q d, ... k d -> ... q k') / sqrt(d)
+        P = torch.exp(S - L.unsqueeze(-1))
+        dV = einsum(P, dO, '... q k, ... q d -> ... k d')
+        dP = einsum(dO, V, '... q d, ... k d -> ... q k')
+
+        D = (O * dO).sum(dim=-1)
+        dS = P * (dP - D.unsqueeze(-1))
+
+        dQ = einsum(dS, K, '... q k, ... k d -> ... q d') / sqrt(d)
+        dK = einsum(dS, Q, '... q k, ... q d -> ... k d') / sqrt(d)
+        return dQ, dK, dV, None
