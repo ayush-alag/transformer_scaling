@@ -55,8 +55,9 @@ def flash_fwd_kernel(
 
     # now let's load Q, O, L
     q_tile = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    original_q_tile_dtype = q_tile.dtype
     # store q as float16
-    q_tile = (q_tile * scale).to(tl.float16)
+    q_tile = (q_tile * scale).to(original_q_tile_dtype)
 
     # our temporary variables stored in memory
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
@@ -67,8 +68,8 @@ def flash_fwd_kernel(
     max_tiles = (query_tile_index + 1) * Q_TILE_SIZE if is_causal else N_KEYS
     for k_tile_index in range(tl.cdiv(max_tiles, K_TILE_SIZE)):
         # load the K tile
-        kt_tile = tl.load(kt_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16) # (D, K_TILE_SIZE)
-        v_tile = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float16) # (K_TILE_SIZE, D)
+        kt_tile = tl.load(kt_block_ptr, boundary_check=(0, 1), padding_option="zero") # (D, K_TILE_SIZE)
+        v_tile = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
 
         # accumulate matrix multiplication
         s_ij = tl.zeros((Q_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
@@ -173,8 +174,8 @@ class FlashAttention2(torch.autograd.Function):
         t_q_range = ceil(n_q / b_q)
         t_k_range = ceil(n_k / b_k)
 
-        O = torch.zeros(b, n_q, d)
-        L = torch.zeros(b, n_q)
+        O = torch.zeros(b, n_q, d).to(q.device)
+        L = torch.zeros(b, n_q).to(q.device)
 
         for i in range(t_q_range):
             # load the tiles
@@ -187,9 +188,9 @@ class FlashAttention2(torch.autograd.Function):
 
             # need to store prev_m_i, prev_l_i, prev_o_i as copies
             # m initialized to minus infinity with size q.shape[0]
-            prev_m_i = torch.full((b, b_q), -float('inf'))
-            prev_l_i = torch.zeros((b, b_q))
-            prev_o_i = torch.zeros((b, b_q, d))
+            prev_m_i = torch.full((b, b_q), -float('inf')).to(q.device)
+            prev_l_i = torch.zeros((b, b_q)).to(q.device)
+            prev_o_i = torch.zeros((b, b_q, d)).to(q.device)
 
             for j in range(t_k_range):
                 start_k = j * b_k
