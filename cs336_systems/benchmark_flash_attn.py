@@ -7,6 +7,7 @@ from math import sqrt
 import argparse
 
 from cs336_systems.flash_attention2 import FlashAttention2, TritonFlashAttention2
+from cs336_basics.model import scaled_dot_product_attention
 
 
 def generate_inputs(batch_size: int, seq_len: int, dim: int, dtype: torch.dtype, device: str = "cuda") -> Tuple[torch.Tensor, ...]:
@@ -17,9 +18,12 @@ def generate_inputs(batch_size: int, seq_len: int, dim: int, dtype: torch.dtype,
     do = torch.randn(batch_size, seq_len, dim, device=device, dtype=dtype)
     return q, k, v, do
 
-@torch.compile()
+# @torch.compile()
 def flash_attn_compiled(q, k, v, is_causal):
     return FlashAttention2.apply(q, k, v, is_causal)
+
+def pytorch_vanilla_attn(q, k, v, is_causal=True):
+    return scaled_dot_product_attention(q, k, v, mask=None if not is_causal else None)
 
 def pytorch_flash_attn(q, k, v, is_causal=True):
     return flash_attn_compiled(q, k, v, is_causal)
@@ -27,10 +31,11 @@ def pytorch_flash_attn(q, k, v, is_causal=True):
 def triton_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
     return TritonFlashAttention2.apply(q, k, v, is_causal)
 
-# impl is either pytorch_flash_attn or triton_flash_attn
+# impl is either pytorch_vanilla_attn or triton_flash_attn
 def benchmark_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl) -> float:
     return triton.testing.do_bench(lambda: impl(q, k, v, True))
 
+# impl is either pytorch_vanilla_attn or compiled pytorch_flash_attn
 def benchmark_backward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, do: torch.Tensor, impl) -> float:
     def run_backward():
         out = impl(q, k, v, True)
@@ -41,7 +46,7 @@ def benchmark_backward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, do: to
 
 def benchmark_configs():
     seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
-    dims = [8, 16, 32, 64, 128]
+    dims = [16, 32, 64, 128]
     dtypes = [torch.bfloat16, torch.float32]
 
     results_by_dtype = {dtype: [] for dtype in dtypes}
@@ -69,13 +74,13 @@ def benchmark_configs():
                     q_tile_size = 16
                     k_tile_size = 16
 
-                # Benchmark PyTorch
-                pytorch_fwd = benchmark_forward(q, k, v, pytorch_flash_attn)
-                pytorch_bwd = benchmark_backward(q, k, v, do, pytorch_flash_attn)
+                # Benchmark vanilla pytorch attention
+                pytorch_fwd = benchmark_forward(q, k, v, pytorch_vanilla_attn)
+                pytorch_bwd = benchmark_backward(q, k, v, do, pytorch_vanilla_attn)
 
-                # Benchmark Triton
+                # Benchmark partial Triton
                 triton_fwd = benchmark_forward(q, k, v, triton_flash_attn)
-                triton_bwd = benchmark_backward(q, k, v, do, triton_flash_attn)
+                triton_bwd = benchmark_backward(q, k, v, do, pytorch_flash_attn)
 
                 results_by_dtype[dtype].append({
                     'seq_len': seq_len,
@@ -87,6 +92,9 @@ def benchmark_configs():
                     'triton_backward_ms': triton_bwd,
                     'triton_total_ms': triton_fwd + triton_bwd,
                 })
+
+                print(f"pytorch_vanilla_attn: {pytorch_fwd} ms, {pytorch_bwd} ms, {pytorch_fwd + pytorch_bwd} ms")
+                print(f"triton_flash_attn: {triton_fwd} ms, {triton_bwd} ms, {triton_fwd + triton_bwd} ms")
 
                 # Clear GPU memory
                 torch.cuda.empty_cache()
