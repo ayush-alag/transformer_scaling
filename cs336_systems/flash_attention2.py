@@ -155,13 +155,13 @@ class TritonFlashAttention2(torch.autograd.Function):
             is_causal=ctx.is_causal,
         )
 
-        ctx.save_for_backward(o, l, k, v)
+        ctx.save_for_backward(o, l, q, k, v)
 
         return o
 
     @staticmethod
     def backward(ctx, dO):
-        return NotImplementedError
+        return FlashAttention2.backward(ctx, dO)
 
 
 class FlashAttention2(torch.autograd.Function):
@@ -174,8 +174,10 @@ class FlashAttention2(torch.autograd.Function):
         t_q_range = ceil(n_q / b_q)
         t_k_range = ceil(n_k / b_k)
 
-        O = torch.zeros(b, n_q, d).to(q.device)
-        L = torch.zeros(b, n_q).to(q.device)
+        O = torch.zeros(b, n_q, d, device=q.device, dtype=q.dtype)
+        L = torch.zeros(b, n_q, device=q.device, dtype=q.dtype)
+
+        ctx.is_causal = mask
 
         for i in range(t_q_range):
             # load the tiles
@@ -188,9 +190,9 @@ class FlashAttention2(torch.autograd.Function):
 
             # need to store prev_m_i, prev_l_i, prev_o_i as copies
             # m initialized to minus infinity with size q.shape[0]
-            prev_m_i = torch.full((b, b_q), -float('inf')).to(q.device)
-            prev_l_i = torch.zeros((b, b_q)).to(q.device)
-            prev_o_i = torch.zeros((b, b_q, d)).to(q.device)
+            prev_m_i = torch.full((b, b_q), -float('inf'), dtype=q.dtype, device=q.device)
+            prev_l_i = torch.zeros((b, b_q), dtype=q.dtype, device=q.device)
+            prev_o_i = torch.zeros((b, b_q, d), dtype=q.dtype, device=q.device)
 
             for j in range(t_k_range):
                 start_k = j * b_k
@@ -227,6 +229,10 @@ class FlashAttention2(torch.autograd.Function):
         d = K.shape[-1]
         # return dQ, dK, dV
         S = einsum(Q, K, '... q d, ... k d -> ... q k') / sqrt(d)
+        if ctx.is_causal:
+            mask = torch.triu(torch.ones(S.shape[-2], S.shape[-1], device=S.device, dtype=torch.bool), diagonal=1)
+            S = S.masked_fill(mask, float('-inf'))
+
         P = torch.exp(S - L.unsqueeze(-1))
         dV = einsum(P, dO, '... q k, ... q d -> ... k d')
         dP = einsum(dO, V, '... q d, ... k d -> ... q k')

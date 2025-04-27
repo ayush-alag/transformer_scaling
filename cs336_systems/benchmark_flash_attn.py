@@ -18,12 +18,16 @@ def generate_inputs(batch_size: int, seq_len: int, dim: int, dtype: torch.dtype,
     do = torch.randn(batch_size, seq_len, dim, device=device, dtype=dtype)
     return q, k, v, do
 
-# @torch.compile()
+@torch.compile()
 def flash_attn_compiled(q, k, v, is_causal):
     return FlashAttention2.apply(q, k, v, is_causal)
 
 def pytorch_vanilla_attn(q, k, v, is_causal=True):
-    return scaled_dot_product_attention(q, k, v, mask=None if not is_causal else None)
+    if is_causal:
+        mask = torch.triu(torch.ones(q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool), diagonal=1)
+        return scaled_dot_product_attention(q, k, v, mask=mask)
+    else:
+        return scaled_dot_product_attention(q, k, v, mask=None)
 
 def pytorch_flash_attn(q, k, v, is_causal=True):
     return flash_attn_compiled(q, k, v, is_causal)
@@ -32,17 +36,61 @@ def triton_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_caus
     return TritonFlashAttention2.apply(q, k, v, is_causal)
 
 # impl is either pytorch_vanilla_attn or triton_flash_attn
-def benchmark_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl) -> float:
-    return triton.testing.do_bench(lambda: impl(q, k, v, True))
+def benchmark_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl, warmup: int = 5, rep: int = 10) -> float:
+    for _ in range(warmup):
+        _ = impl(q, k, v, True)
+        torch.cuda.synchronize()
+
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt   = torch.cuda.Event(enable_timing=True)
+
+    times = []
+    for _ in range(rep):
+        start_evt.record()
+        impl(q, k, v, True)
+        torch.cuda.synchronize()
+        end_evt.record()
+        torch.cuda.synchronize()
+        times.append(start_evt.elapsed_time(end_evt))
+
+    return sum(times) / len(times)
 
 # impl is either pytorch_vanilla_attn or compiled pytorch_flash_attn
-def benchmark_backward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, do: torch.Tensor, impl) -> float:
-    def run_backward():
+def benchmark_backward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, do: torch.Tensor, impl, warmup: int = 5, rep: int = 10) -> float:
+    for _ in range(warmup):
         out = impl(q, k, v, True)
+        torch.cuda.synchronize()
         out.backward(do)
         torch.cuda.synchronize()
 
-    return triton.testing.do_bench(run_backward)
+        if q.grad is not None: q.grad.zero_()
+        if k.grad is not None: k.grad.zero_()
+        if v.grad is not None: v.grad.zero_()
+
+    outputs = []
+    for _ in range(rep):
+        out = impl(q, k, v, True)
+        torch.cuda.synchronize()
+        outputs.append(out)
+
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt   = torch.cuda.Event(enable_timing=True)
+
+    times = []
+    for out in outputs:
+        start_evt.record()
+        out.backward(do)
+        torch.cuda.synchronize()
+        end_evt.record()
+        torch.cuda.synchronize()
+        times.append(start_evt.elapsed_time(end_evt))
+
+        # zero gradients so next iteration is clean
+        if q.grad is not None: q.grad.zero_()
+        if k.grad is not None: k.grad.zero_()
+        if v.grad is not None: v.grad.zero_()
+
+    return sum(times) / len(times)
 
 def benchmark_configs():
     seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
@@ -62,6 +110,7 @@ def benchmark_configs():
 
                 # Generate inputs
                 q, k, v, do = generate_inputs(1, seq_len, dim, dtype)
+                print("Generated inputs")
 
                 # Adjust tile sizes based on input dimensions
                 if seq_len <= 2048:
@@ -77,11 +126,12 @@ def benchmark_configs():
                 # Benchmark vanilla pytorch attention
                 pytorch_fwd = benchmark_forward(q, k, v, pytorch_vanilla_attn)
                 pytorch_bwd = benchmark_backward(q, k, v, do, pytorch_vanilla_attn)
-
+                print("Finished vanilla pytorch")
                 # Benchmark partial Triton
                 triton_fwd = benchmark_forward(q, k, v, triton_flash_attn)
+                print("Finished triton forward")
                 triton_bwd = benchmark_backward(q, k, v, do, pytorch_flash_attn)
-
+                print("Finished triton backward")
                 results_by_dtype[dtype].append({
                     'seq_len': seq_len,
                     'dim': dim,
@@ -98,6 +148,7 @@ def benchmark_configs():
 
                 # Clear GPU memory
                 torch.cuda.empty_cache()
+                print("Cleared GPU memory")
 
     # Create DataFrames and convert to LaTeX tables
     latex_tables = {}
