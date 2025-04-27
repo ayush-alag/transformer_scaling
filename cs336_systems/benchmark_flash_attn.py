@@ -18,7 +18,7 @@ def generate_inputs(batch_size: int, seq_len: int, dim: int, dtype: torch.dtype,
     do = torch.randn(batch_size, seq_len, dim, device=device, dtype=dtype)
     return q, k, v, do
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def flash_attn_compiled(q, k, v, is_causal):
     return FlashAttention2.apply(q, k, v, is_causal)
 

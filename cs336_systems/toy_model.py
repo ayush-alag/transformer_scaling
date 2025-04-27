@@ -10,15 +10,15 @@ class ToyModel(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        print("Weight type", self.fc1.weight.dtype)
+        # print("Weight type", self.fc1.weight.dtype)
         x = self.fc1(x)
-        print("Activation type", x.dtype)
+        # print("Activation type", x.dtype)
         x = self.relu(x)
-        print("ReLU type", x.dtype)
+        # print("ReLU type", x.dtype)
         x = self.ln(x)
-        print("LN type", x.dtype)
+        # print("LN type", x.dtype)
         x = self.fc2(x)
-        print("FC2 type", x.dtype)
+        # print("FC2 type", x.dtype)
         return x
 
 device = torch.device("cuda")
@@ -29,5 +29,5 @@ with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
     # calculate loss and gradients
     loss = y.sum()
     loss.backward()
-    print("Loss type", loss.dtype)
-    print("Gradient type", model.fc1.weight.grad.dtype)
+    # print("Loss type", loss.dtype)
+    # print("Gradient type", model.fc1.weight.grad.dtype)
