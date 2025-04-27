@@ -6,6 +6,7 @@ import torch
 
 from cs336_systems.flash_attention2 import FlashAttention2, TritonFlashAttention2
 from cs336_systems.ddp_container import DDP
+from cs336_systems.ddp_bucketed_container import DDP_Bucketed
 
 def get_flashattention_autograd_function_pytorch() -> Type:
     """
@@ -89,7 +90,7 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     Returns:
         Instance of a DDP class.
     """
-    raise NotImplementedError
+    return DDP_Bucketed(module, bucket_size_mb)
 
 
 def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -104,7 +105,7 @@ def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    ddp_model.finish_gradient_synchronization()
 
 
 def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -117,7 +118,7 @@ def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: tor
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    raise NotImplementedError
+    pass
 
 
 def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
