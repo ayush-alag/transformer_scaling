@@ -33,7 +33,11 @@ def triton_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_caus
     return TritonFlashAttention2.apply(q, k, v, is_causal)
 
 def pytorch_vanilla_attn(q, k, v, is_causal=True):
-    return scaled_dot_product_attention(q, k, v, mask=None if not is_causal else None)
+    if is_causal:
+        mask = torch.triu(torch.ones(q.shape[-2], k.shape[-2], device=q.device, dtype=torch.bool), diagonal=1)
+        return scaled_dot_product_attention(q, k, v, mask=mask)
+    else:
+        return scaled_dot_product_attention(q, k, v, mask=None)
 
 def pytorch_vanilla_bwd(q, k, v, is_causal, do):
     out = pytorch_vanilla_attn(q, k, v, is_causal)
@@ -63,6 +67,7 @@ def benchmark_configs():
 
                 # Generate inputs
                 q, k, v, do = generate_inputs(1, seq_len, dim, dtype)
+                print("Generated inputs")
 
                 # These are not actually being used
                 if seq_len <= 2048:
@@ -81,8 +86,8 @@ def benchmark_configs():
                 # Benchmark partial Triton
                 triton_fwd = triton.testing.do_bench(lambda: triton_flash_attn(q, k, v, True))
                 triton_bwd = triton.testing.do_bench(lambda: (copmiled_flash_bwd(q, k, v, True), torch.cuda.synchronize()))
-
-                results_by_dtype[dtype].append({
+                
+		results_by_dtype[dtype].append({
                     'seq_len': seq_len,
                     'dim': dim,
                     'pytorch_forward_ms': pytorch_fwd,
@@ -97,6 +102,7 @@ def benchmark_configs():
                 print(f"triton_flash_attn: {triton_fwd} ms, {triton_bwd} ms, {triton_fwd + triton_bwd} ms")
 
                 torch.cuda.empty_cache()
+                print("Cleared GPU memory")
 
     # Create DataFrames and convert to LaTeX tables
     latex_tables = {}
