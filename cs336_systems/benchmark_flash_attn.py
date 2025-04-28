@@ -1,14 +1,25 @@
 import torch
 import triton
 import pandas as pd
-from typing import Tuple, List
-from einops import einsum
-from math import sqrt
-import argparse
+from typing import Tuple
+import logging
 
-from cs336_systems.flash_attention2 import FlashAttention2, TritonFlashAttention2
+logging.basicConfig(level=logging.DEBUG, force=True)
+torch._logging.set_logs(
+    recompiles=True,    # “why did we recompile?”
+    dynamo=True,        # entry/exit of Dynamo
+    aot_eager=True,     # AOT Autograd
+    inductor=True       # lowering kernels
+)
+torch._dynamo.config.verbose      = True
+torch._dynamo.config.log_level    = logging.DEBUG
+torch._dynamo.config.log_compile  = True
+torch._dynamo.config.log_graph_breaks = True
+torch._dynamo.config.suppress_errors = False
+torch._inductor.config.debug      = True
+
+from cs336_systems.flash_attention2 import TritonFlashAttention2
 from cs336_basics.model import scaled_dot_product_attention
-
 
 def generate_inputs(batch_size: int, seq_len: int, dim: int, dtype: torch.dtype, device: str = "cuda") -> Tuple[torch.Tensor, ...]:
     torch.manual_seed(0)
@@ -18,31 +29,21 @@ def generate_inputs(batch_size: int, seq_len: int, dim: int, dtype: torch.dtype,
     do = torch.randn(batch_size, seq_len, dim, device=device, dtype=dtype)
     return q, k, v, do
 
-# @torch.compile()
-def flash_attn_compiled(q, k, v, is_causal):
-    return FlashAttention2.apply(q, k, v, is_causal)
+def triton_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    return TritonFlashAttention2.apply(q, k, v, is_causal)
 
 def pytorch_vanilla_attn(q, k, v, is_causal=True):
     return scaled_dot_product_attention(q, k, v, mask=None if not is_causal else None)
 
-def pytorch_flash_attn(q, k, v, is_causal=True):
-    return flash_attn_compiled(q, k, v, is_causal)
+def pytorch_vanilla_bwd(q, k, v, is_causal, do):
+    out = pytorch_vanilla_attn(q, k, v, is_causal)
+    out.backward(do)
 
-def triton_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
-    return TritonFlashAttention2.apply(q, k, v, is_causal)
+def pytorch_flash_bwd(q, k, v, is_causal, do):
+    out = triton_flash_attn(q, k, v, is_causal)
+    out.backward(do)
 
-# impl is either pytorch_vanilla_attn or triton_flash_attn
-def benchmark_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl) -> float:
-    return triton.testing.do_bench(lambda: impl(q, k, v, True))
-
-# impl is either pytorch_vanilla_attn or compiled pytorch_flash_attn
-def benchmark_backward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, do: torch.Tensor, impl) -> float:
-    def run_backward():
-        out = impl(q, k, v, True)
-        out.backward(do)
-        torch.cuda.synchronize()
-
-    return triton.testing.do_bench(run_backward)
+copmiled_flash_bwd = torch.compile(pytorch_flash_bwd)
 
 def benchmark_configs():
     seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
@@ -63,7 +64,7 @@ def benchmark_configs():
                 # Generate inputs
                 q, k, v, do = generate_inputs(1, seq_len, dim, dtype)
 
-                # Adjust tile sizes based on input dimensions
+                # These are not actually being used
                 if seq_len <= 2048:
                     q_tile_size = 64
                     k_tile_size = 64
@@ -75,12 +76,11 @@ def benchmark_configs():
                     k_tile_size = 16
 
                 # Benchmark vanilla pytorch attention
-                pytorch_fwd = benchmark_forward(q, k, v, pytorch_vanilla_attn)
-                pytorch_bwd = benchmark_backward(q, k, v, do, pytorch_vanilla_attn)
-
+                pytorch_fwd = triton.testing.do_bench(lambda: pytorch_vanilla_attn(q, k, v, True))
+                pytorch_bwd = triton.testing.do_bench(lambda: (pytorch_vanilla_bwd(q, k, v, True, do), torch.cuda.synchronize()))
                 # Benchmark partial Triton
-                triton_fwd = benchmark_forward(q, k, v, triton_flash_attn)
-                triton_bwd = benchmark_backward(q, k, v, do, pytorch_flash_attn)
+                triton_fwd = triton.testing.do_bench(lambda: triton_flash_attn(q, k, v, True))
+                triton_bwd = triton.testing.do_bench(lambda: (copmiled_flash_bwd(q, k, v, True), torch.cuda.synchronize()))
 
                 results_by_dtype[dtype].append({
                     'seq_len': seq_len,
@@ -96,7 +96,6 @@ def benchmark_configs():
                 print(f"pytorch_vanilla_attn: {pytorch_fwd} ms, {pytorch_bwd} ms, {pytorch_fwd + pytorch_bwd} ms")
                 print(f"triton_flash_attn: {triton_fwd} ms, {triton_bwd} ms, {triton_fwd + triton_bwd} ms")
 
-                # Clear GPU memory
                 torch.cuda.empty_cache()
 
     # Create DataFrames and convert to LaTeX tables
