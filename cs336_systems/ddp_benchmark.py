@@ -14,7 +14,7 @@ from cs336_systems.ddp_container import DDP
 
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = "29501"
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
@@ -219,7 +219,7 @@ if __name__ == "__main__":
 
     # type of ddp
     parser.add_argument("--ddp_type", type=str, default="naive", choices=["naive", "flat_ddp", "individual_ddp", "bucketed_ddp"])
-    parser.add_argument("--bucket_size_mb", type=int, default=100)
+    parser.add_argument("--bucket_size_mb", type=float, default=100)
     args = parser.parse_args()
 
     full_data = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length))
