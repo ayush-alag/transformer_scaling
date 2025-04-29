@@ -224,7 +224,7 @@ class FlashAttention2(torch.autograd.Function):
         return O
 
     @staticmethod
-    @torch.compile
+    @torch.compile(fullgraph=True)
     def backward(ctx, dO):
         O, L, Q, K, V = ctx.saved_tensors
         d = K.shape[-1]

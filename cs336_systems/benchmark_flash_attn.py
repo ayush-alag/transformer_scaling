@@ -5,18 +5,9 @@ from typing import Tuple
 import logging
 
 logging.basicConfig(level=logging.DEBUG, force=True)
-torch._logging.set_logs(
-    recompiles=True,    # “why did we recompile?”
-    dynamo=True,        # entry/exit of Dynamo
-    aot_eager=True,     # AOT Autograd
-    inductor=True       # lowering kernels
-)
-torch._dynamo.config.verbose      = True
-torch._dynamo.config.log_level    = logging.DEBUG
-torch._dynamo.config.log_compile  = True
-torch._dynamo.config.log_graph_breaks = True
-torch._dynamo.config.suppress_errors = False
-torch._inductor.config.debug      = True
+torch._dynamo.config.verbose = True
+torch.autograd.set_detect_anomaly(True)
+torch._inductor.config.debug = True
 
 from cs336_systems.flash_attention2 import TritonFlashAttention2
 from cs336_basics.model import scaled_dot_product_attention
@@ -47,17 +38,18 @@ def pytorch_flash_bwd(q, k, v, is_causal, do):
     out = triton_flash_attn(q, k, v, is_causal)
     out.backward(do)
 
-copmiled_flash_bwd = torch.compile(pytorch_flash_bwd)
-
 def benchmark_configs():
     seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     dims = [16, 32, 64, 128]
     dtypes = [torch.bfloat16, torch.float32]
-
+    
     results_by_dtype = {dtype: [] for dtype in dtypes}
 
     for dtype in dtypes:
         for seq_len in seq_lengths:
+            if dtype == torch.float32 and seq_len == 65536:
+                continue
+            
             for dim in dims:
                 # Skip configurations that would exceed GPU memory
                 if seq_len * dim * (8 if dtype == torch.float32 else 4) > 2**31:
@@ -82,12 +74,16 @@ def benchmark_configs():
 
                 # Benchmark vanilla pytorch attention
                 pytorch_fwd = triton.testing.do_bench(lambda: pytorch_vanilla_attn(q, k, v, True))
-                pytorch_bwd = triton.testing.do_bench(lambda: (pytorch_vanilla_bwd(q, k, v, True, do), torch.cuda.synchronize()))
+                pytorch_bwd = triton.testing.do_bench(lambda: (pytorch_vanilla_bwd(q, k, v, False, do), torch.cuda.synchronize()))
                 # Benchmark partial Triton
                 triton_fwd = triton.testing.do_bench(lambda: triton_flash_attn(q, k, v, True))
-                triton_bwd = triton.testing.do_bench(lambda: (copmiled_flash_bwd(q, k, v, True), torch.cuda.synchronize()))
+                triton_bwd = triton.testing.do_bench(lambda: (pytorch_flash_bwd(q, k, v, True, do), torch.cuda.synchronize()))
                 
+<<<<<<< HEAD
 		        results_by_dtype[dtype].append({
+=======
+                results_by_dtype[dtype].append({
+>>>>>>> 1c443c0591180211cc3c6d9caeff865c45b6a3d6
                     'seq_len': seq_len,
                     'dim': dim,
                     'pytorch_forward_ms': pytorch_fwd,
@@ -110,13 +106,12 @@ def benchmark_configs():
         df = pd.DataFrame(results)
         latex_table = df.to_latex(index=False, float_format=lambda x: '{:.2f}'.format(x))
         latex_tables[str(dtype).split('.')[-1]] = latex_table
-    return latex_tables
+        print("\nLaTeX Table:")
+        print(latex_table)
 
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This benchmark requires a CUDA GPU"
     assert torch.cuda.get_device_name().startswith("NVIDIA H100"), "This benchmark should be run on an H100 GPU"
 
-    results_df = benchmark_configs()
-    print("\nBenchmark Results:")
-    print(results_df.to_string(index=False))
+    benchmark_configs()
