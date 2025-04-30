@@ -73,21 +73,23 @@ def benchmark_configs():
                     k_tile_size = 16
 
                 # Benchmark vanilla pytorch attention
-                pytorch_fwd = triton.testing.do_bench(lambda: pytorch_vanilla_attn(q, k, v, True))
-                pytorch_bwd = triton.testing.do_bench(lambda: (pytorch_vanilla_bwd(q, k, v, False, do), torch.cuda.synchronize()))
+                pytorch_fwd = triton.testing.do_bench(lambda: pytorch_vanilla_attn(q, k, v, False))
+                pytorch_both = triton.testing.do_bench(lambda: (pytorch_vanilla_bwd(q, k, v, False, do), torch.cuda.synchronize()))
+                pytorch_bwd = pytorch_both - pytorch_fwd
                 # Benchmark partial Triton
-                triton_fwd = triton.testing.do_bench(lambda: triton_flash_attn(q, k, v, True))
-                triton_bwd = triton.testing.do_bench(lambda: (pytorch_flash_bwd(q, k, v, True, do), torch.cuda.synchronize()))
+                triton_fwd = triton.testing.do_bench(lambda: triton_flash_attn(q, k, v, False))
+                triton_both = triton.testing.do_bench(lambda: (pytorch_flash_bwd(q, k, v, False, do), torch.cuda.synchronize()))
+                triton_bwd = triton_both - triton_fwd
                 
                 results_by_dtype[dtype].append({
                     'seq_len': seq_len,
                     'dim': dim,
                     'pytorch_forward_ms': pytorch_fwd,
                     'pytorch_backward_ms': pytorch_bwd,
-                    'pytorch_total_ms': pytorch_fwd + pytorch_bwd,
+                    'pytorch_total_ms': pytorch_both,
                     'triton_forward_ms': triton_fwd,
                     'triton_backward_ms': triton_bwd,
-                    'triton_total_ms': triton_fwd + triton_bwd,
+                    'triton_total_ms': triton_both,
                 })
 
                 print(f"pytorch_vanilla_attn: {pytorch_fwd} ms, {pytorch_bwd} ms, {pytorch_fwd + pytorch_bwd} ms")
