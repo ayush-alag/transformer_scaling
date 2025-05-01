@@ -42,14 +42,14 @@ def benchmark_configs():
     seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     dims = [16, 32, 64, 128]
     dtypes = [torch.bfloat16, torch.float32]
-    
+
     results_by_dtype = {dtype: [] for dtype in dtypes}
 
     for dtype in dtypes:
         for seq_len in seq_lengths:
             if dtype == torch.float32 and seq_len == 65536:
                 continue
-            
+
             for dim in dims:
                 # Skip configurations that would exceed GPU memory
                 if seq_len * dim * (8 if dtype == torch.float32 else 4) > 2**31:
@@ -80,12 +80,8 @@ def benchmark_configs():
                 triton_fwd = triton.testing.do_bench(lambda: triton_flash_attn(q, k, v, False))
                 triton_both = triton.testing.do_bench(lambda: (pytorch_flash_bwd(q, k, v, False, do), torch.cuda.synchronize()))
                 triton_bwd = triton_both - triton_fwd
-                
-<<<<<<< HEAD
-		        results_by_dtype[dtype].append({
-=======
+
                 results_by_dtype[dtype].append({
->>>>>>> 1c443c0591180211cc3c6d9caeff865c45b6a3d6
                     'seq_len': seq_len,
                     'dim': dim,
                     'pytorch_forward_ms': pytorch_fwd,
