@@ -80,7 +80,6 @@ def benchmark_configs():
                 triton_fwd = triton.testing.do_bench(lambda: triton_flash_attn(q, k, v, False))
                 triton_both = triton.testing.do_bench(lambda: (pytorch_flash_bwd(q, k, v, False, do), torch.cuda.synchronize()))
                 triton_bwd = triton_both - triton_fwd
-
                 results_by_dtype[dtype].append({
                     'seq_len': seq_len,
                     'dim': dim,
