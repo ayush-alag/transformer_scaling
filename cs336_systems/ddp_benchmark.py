@@ -5,7 +5,7 @@ import torch.multiprocessing as mp
 import argparse
 from timeit import default_timer as timer
 import pandas as pd
-from torch.profiler import profile, record_function, ProfilerActivity
+import torch.cuda.nvtx as nvtx
 
 from cs336_basics.optimizer import AdamW
 from cs336_basics.model import BasicsTransformerLM
@@ -43,19 +43,22 @@ def flat_ddp(model, data, optimizer, num_trials, num_warmup_trials, step_times, 
 
         start_time = timer()
         # get the gradients for the batch
-        with record_function("forward"):
-            output = model(data)
-            loss = output.sum()
-        with record_function("backward"):
-            loss.backward()
-            torch.cuda.synchronize()
+        output = model(data)
+        loss = output.sum()
+        nvtx.range_pop()
+
+        nvtx.range_push("backward")
+        loss.backward()
+        torch.cuda.synchronize()
+        nvtx.range_pop()
 
         communication_start_time = timer()
         flatten_params = torch._utils._flatten_dense_tensors(tensors=[param.grad for param in model.parameters()])
 
-        with record_function("all_reduce"):
         # a single all reduce for the flattened parameters
-            dist.all_reduce(flatten_params, op=dist.ReduceOp.SUM, async_op=False)
+        nvtx.range_push("all_reduce")
+        dist.all_reduce(flatten_params, op=dist.ReduceOp.SUM, async_op=False)
+        nvtx.range_pop()
 
         unflatten_params = torch._utils._unflatten_dense_tensors(flatten_params, tensors=[param.grad for param in model.parameters()])
         for param, unflattened_param in zip(model.parameters(), unflatten_params):
@@ -87,15 +90,22 @@ def naive_ddp(model, data, optimizer, num_trials, num_warmup_trials, step_times,
 
         start_time = timer()
         # get the gradients for the batch
+        nvtx.range_push("forward")
         output = model(data)
         loss = output.sum()
+        nvtx.range_pop()
+
+        nvtx.range_push("backward")
         loss.backward()
         torch.cuda.synchronize()
+        nvtx.range_pop()
 
         communication_start_time = timer()
         # flat all reduce the gradients
+        nvtx.range_push("all_reduce")
         for param in model.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=False)
+        nvtx.range_pop()
 
         torch.cuda.synchronize()
         communication_time = timer() - communication_start_time
@@ -119,13 +129,18 @@ def individual_ddp(model, data, optimizer, num_trials, num_warmup_trials, step_t
         torch.cuda.synchronize()
 
         start_time = timer()
-        with record_function("forward"):
-            output = ddp(data)
-            loss = output.sum()
-        with record_function("backward"):
-            loss.backward()
-        with record_function("grad_sync"):
-            ddp.finish_gradient_synchronization()
+        nvtx.range_push("forward")
+        output = ddp(data)
+        loss = output.sum()
+        nvtx.range_pop()
+
+        nvtx.range_push("backward")
+        loss.backward()
+        nvtx.range_pop()
+
+        nvtx.range_push("grad_sync")
+        ddp.finish_gradient_synchronization()
+        nvtx.range_pop()
 
         optimizer.step()
         step_times.append(timer() - start_time)
@@ -157,13 +172,6 @@ def benchmark_driver(rank, world_size, data, num_layers, batch_size,
                      context_length, d_model, num_heads, d_ff,
                      ddp_type, bucket_size_mb, result_queue):
     setup(rank, world_size)
-    trace_path = f"trace_{ddp_type}.json"
-    prof = profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    )
 
     torch.manual_seed(0)
 
@@ -190,7 +198,6 @@ def benchmark_driver(rank, world_size, data, num_layers, batch_size,
     step_times = []
     communication_times = []
 
-    prof.start()
     if ddp_type == "naive":
         naive_ddp(transformer, data, optimizer, num_trials, num_warmup_trials, step_times, communication_times)
     elif ddp_type == "flat_ddp":
@@ -199,7 +206,6 @@ def benchmark_driver(rank, world_size, data, num_layers, batch_size,
         individual_ddp(transformer, data, optimizer, num_trials, num_warmup_trials, step_times, communication_times)
     elif ddp_type == "bucketed_ddp":
         bucketed_ddp(transformer, data, optimizer, num_trials, num_warmup_trials, step_times, communication_times, bucket_size_mb)
-    prof.stop()
 
     step_t = torch.tensor(step_times, device=device)
     gathered_steps = [torch.zeros_like(step_t) for _ in range(world_size)]
@@ -216,7 +222,6 @@ def benchmark_driver(rank, world_size, data, num_layers, batch_size,
         steps = [x for t in gathered_steps for x in t.cpu().tolist()]
         comms = [x for t in gathered_comms for x in t.cpu().tolist()]
         result_queue.put((steps, comms))
-        prof.export_chrome_trace(trace_path)
 
 if __name__ == "__main__":
     # add some benchmark arguments via commandline: gloo vs nccl, data size, num processes, num trials, num warmup trials

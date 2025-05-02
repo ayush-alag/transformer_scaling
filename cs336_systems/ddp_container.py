@@ -1,5 +1,8 @@
 import torch.distributed as dist
 import torch
+import torch.cuda.nvtx as nvtx
+from torch.autograd.profiler import record_function
+
 
 class DDP(torch.nn.Module):
     def __init__(self, module: torch.nn.Module):
@@ -17,7 +20,8 @@ class DDP(torch.nn.Module):
         with torch.no_grad():
             param.grad.data /= dist.get_world_size()
 
-        self.handles.append(dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, async_op=True))
+        with record_function("allreduce_async"):
+            self.handles.append(dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, async_op=True))
 
     def forward(self, *inputs, **kwargs):
         return self.module.forward(*inputs, **kwargs)
